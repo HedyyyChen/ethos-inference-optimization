@@ -51,6 +51,9 @@ logger = get_logger()
 @option("--output", default="results", help="Path where to save results.")
 @option("--model_name", default=None, help="Name of the model, used for the output directory.")
 @option("--no_time_offset", is_flag=True, help="Don't do 24h-time-offset for ICU mortality.")
+@option("--use_kv_cache/--no_kv_cache", default=True, help="Whether to use KV cache for inference.")
+@option("--kv_cache_fp16", is_flag=True, help="Whether to use Float16 compression for KV cache.")
+@option("--seed", type=int, default=42, help="Random seed for reproducibility.")
 def infer(
     test: str,
     model: str,
@@ -65,6 +68,9 @@ def infer(
     output: str,
     model_name: Optional[str],
     no_time_offset: bool,
+    use_kv_cache: bool,
+    kv_cache_fp16: bool,
+    seed: int,
 ):
     vocab = Vocabulary(PROJECT_DATA / vocab)
 
@@ -101,7 +107,9 @@ def infer(
 
     model_path = Path(model)
     model, block_size = load_model_from_checkpoint(model_path, device, for_training=False)
-    logger.info(f"Model loaded (block_size={block_size})")
+    # 应用 Float16 压缩配置
+    model.config.kv_cache_fp16 = kv_cache_fp16
+    logger.info(f"Model loaded (block_size={block_size}, kv_cache_fp16={kv_cache_fp16})")
 
     data_path = PROJECT_DATA / data
     fold = data_path.stem.split("_")[1]
@@ -134,5 +142,7 @@ def infer(
         for i, subset in enumerate(subsets)
     ]
     set_start_method("spawn")
-    Parallel(n_jobs=n_jobs)(delayed(run_inference)(loader, data, n_gpus) for loader in loaders)
+    Parallel(n_jobs=n_jobs)(
+        delayed(run_inference)(loader, data, n_gpus, use_kv_cache, seed) for loader in loaders
+    )
     logger.info(f"Done, results saved to '{results_dir}'")

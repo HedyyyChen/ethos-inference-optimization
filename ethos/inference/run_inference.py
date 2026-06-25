@@ -1,6 +1,8 @@
 import json
 import multiprocessing as mp
+import random
 
+import numpy as np
 import torch as th
 from tqdm import tqdm
 
@@ -13,42 +15,78 @@ def get_process_info():
     return proc_name, proc_num
 
 
-def run_inference(loader, args, num_gpus: int = 8):
+def run_inference(loader, args, num_gpus: int = 8, use_kv_cache: bool = True, seed: int = 42):
     model, device, vocab, stoi, results_dir, test_name, suffix, no_compile = args
 
     proc_name, proc_num = get_process_info()
     if device == "cuda":
         device = f"cuda:{proc_num % num_gpus}"
         th.cuda.set_device(device)
+    
+    # 固定随机种子
+    random.seed(seed + proc_num)
+    np.random.seed(seed + proc_num)
+    th.manual_seed(seed + proc_num)
+    if device.startswith("cuda"):
+        th.cuda.manual_seed(seed + proc_num)
+        th.backends.cudnn.deterministic = True
+        th.backends.cudnn.benchmark = False
+
     model.to(device)
     if not no_compile:
-        model = th.compile(model)
+        model = th.compile(model, mode="reduce-overhead")
 
     dataset = loader.dataset.dataset
     context_len = dataset.context_len
     timeline_len = dataset.timeline_len
     max_timeline_size = context_len + timeline_len
-    time_limit = 30 / 365.25 if test_name == Test.READMISSION else 2
+    if test_name == Test.READMISSION:
+        time_limit = 30 / 365.25
+    elif test_name == Test.MM_PFS: 
+        time_limit = 5.0           
+    else:
+        time_limit = 2
     toi = th.tensor(vocab.encode(stoi), device=device, dtype=th.long)
 
     results = []
+
     for timeline, ground_truth in tqdm(
         loader, proc_name, total=len(loader), position=proc_num, smoothing=0
     ):
         timeline = timeline.to(device)
         gen_token_num = 0
         offset = 0
+        kv_caches = None
+        
         while True:
+            # 滑动窗口触发逻辑前置：如果当前 timeline 已满，开启 offset
+            if not offset and len(timeline) >= max_timeline_size:
+                offset = 1
+
             if test_name == Test.SOFA_PREDICTION and gen_token_num == 1:
                 # append a sofa token to the timeline and continue generating
                 last_token = th.tensor(
                     vocab.encode(["SOFA"]), device=timeline.device, dtype=th.long
                 )
+                # 手动插入 token 后必须重置缓存
+                kv_caches = None
             else:
-                last_token, probs = model.get_next_token(timeline[None, ...], return_probs=True)
-
-            if not offset and len(timeline) == max_timeline_size:
-                offset = 1
+                # 如果关闭了 KV 缓存，或者触发了滑动窗口，则不使用旧缓存
+                if not use_kv_cache or offset == 1:
+                    kv_caches = None
+                
+                # 确定需要输入模型的 token：缓存之外的所有 token
+                if use_kv_cache and kv_caches is not None:
+                    # 现在的缓存直接存储 Tensor (Float16 或 Float32)
+                    cache_len = kv_caches[0][0].size(2)
+                else:
+                    cache_len = 0
+                
+                input_tokens = timeline[None, cache_len:]
+                
+                last_token, probs, kv_caches = model.get_next_token(
+                    input_tokens, return_probs=True, top_k=None, kv_caches=kv_caches
+                )    
 
             timeline = th.cat(
                 (timeline[:context_len], timeline[context_len + offset :], last_token.view(-1)),
@@ -58,6 +96,18 @@ def run_inference(loader, args, num_gpus: int = 8):
             if timeline[-1] in toi:
                 stop_reason = "token_of_interest"
                 break
+            
+            # elif test_name == Test.ICU_READMISSION:
+            #     if gen_token_num > 2166:
+            #         stop_reason = "length_limit"
+            #         break
+            #     if gen_token_num > timeline_len:
+            #         timeline_time = vocab.get_timeline_total_time(
+            #         timeline[-gen_token_num:].cpu(), decode=True
+            #     )
+            #         if timeline_time > time_limit:
+            #             stop_reason = "time_limit"
+            #             break
             elif test_name == Test.READMISSION or gen_token_num > timeline_len:
                 timeline_time = vocab.get_timeline_total_time(
                     timeline[-gen_token_num:].cpu(), decode=True

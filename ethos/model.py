@@ -49,7 +49,7 @@ class CausalSelfAttention(nn.Module):
             )
         self.attention_weights = attention_weights
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=None):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -58,31 +58,65 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
+        if kv_cache is not None:
+            prev_k, prev_v = kv_cache
+            # 如果开启了 Float16 压缩，在这里转换回模型精度（通常是 FP32）
+            if hasattr(self, "config") and getattr(self.config, "kv_cache_fp16", False):
+                prev_k = prev_k.to(x.dtype)
+                prev_v = prev_v.to(x.dtype)
+            
+            k = torch.cat((prev_k, k), dim=2)
+            v = torch.cat((prev_v, v), dim=2)
+        
+        # 准备新的缓存
+        if hasattr(self, "config") and getattr(self.config, "kv_cache_fp16", False):
+            new_kv_cache = (k.to(torch.float16), v.to(torch.float16))
+        else:
+            new_kv_cache = (k, v)
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash and self.attention_weights is None:
             # efficient attention using Flash Attention CUDA kernels
+            attn_mask = None
+            if kv_cache is not None and T > 1:
+                # 动态缓存重算块时，需要对块内应用因果掩码
+                # 形状: (T, cache_len + T)
+                cache_len = prev_k.size(2)
+                mask = torch.ones(T, cache_len + T, dtype=torch.bool, device=x.device)
+                mask = torch.tril(mask, diagonal=cache_len)
+                attn_mask = mask
+            
             y = torch.nn.functional.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                attn_mask=None,
+                attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0,
-                is_causal=True,
+                is_causal=kv_cache is None and T > 1,
             )
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            if kv_cache is None:
+                att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            elif T > 1:
+                # 慢速路径下的非对称因果掩码
+                cache_len = prev_k.size(2)
+                row_indices = torch.arange(T, device=x.device).view(-1, 1)
+                col_indices = torch.arange(cache_len + T, device=x.device).view(1, -1)
+                mask = col_indices <= (row_indices + cache_len)
+                att = att.masked_fill(~mask, float("-inf"))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-            self.attention_weights.append(att.detach().cpu())
+            if self.attention_weights is not None:
+                self.attention_weights.append(att.detach().cpu())
         y = (
             y.transpose(1, 2).contiguous().view(B, T, C)
         )  # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, new_kv_cache
 
 
 class MLP(nn.Module):
@@ -109,10 +143,11 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, kv_cache=None):
+        out, new_kv_cache = self.attn(self.ln_1(x), kv_cache=kv_cache)
+        x = x + out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, new_kv_cache
 
 
 @dataclass
@@ -128,6 +163,7 @@ class ModelConfig:
     bias: bool = (
         True  # use bias in the causal layer norm and in the head, but not in the feedforward layer
     )
+    kv_cache_fp16: bool = False  # 是否对 KV 缓存进行 Float16 压缩
 
 
 class Ethos(nn.Module):
@@ -187,13 +223,21 @@ class Ethos(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, context_length=0):
+    def forward(self, idx, targets=None, context_length=0, kv_caches=None):
         device = idx.device
         b, t = idx.size()
+        
+        # 获取缓存长度
+        if kv_caches is not None:
+            # 无论是否是 fp16，现在都是直接存储 Tensor
+            cache_len = kv_caches[0][0].size(2)
+        else:
+            cache_len = 0
+            
         assert (
-            t <= self.config.block_size
-        ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
+            t + cache_len <= self.config.block_size
+        ), f"Cannot forward sequence of length {t + cache_len}, block size is only {self.config.block_size}"
+        pos = torch.arange(cache_len, t + cache_len, dtype=torch.long, device=device)  # shape (t)
 
         if self.return_attention:
             self.attention_weights.clear()
@@ -202,8 +246,10 @@ class Ethos(nn.Module):
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        new_kv_caches = []
+        for i, block in enumerate(self.transformer.h):
+            x, cache = block(x, kv_cache=kv_caches[i] if kv_caches is not None else None)
+            new_kv_caches.append(cache)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -223,7 +269,7 @@ class Ethos(nn.Module):
             logits = self.lm_head(x[:, [-1], :])
             loss = None
 
-        return logits, loss
+        return logits, loss, new_kv_caches
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -284,10 +330,14 @@ class Ethos(nn.Module):
         return idx
 
     @torch.no_grad()
-    def get_next_token(self, tokens, return_probs=False, top_k=None):
-        if tokens.size(1) > self.config.block_size:
-            tokens = tokens[:, -self.config.block_size :]
-        logits, _ = self(tokens)
+    def get_next_token(self, tokens, return_probs=False, top_k=None, kv_caches=None):
+        # if using cache, only pass the last token if tokens is length 1
+        # if tokens is longer than 1, it means we are re-processing a window after truncation
+        idx_cond = tokens[:, [-1]] if (kv_caches is not None and tokens.size(1) == 1) else tokens
+        if idx_cond.size(1) > self.config.block_size:
+            idx_cond = idx_cond[:, -self.config.block_size :]
+
+        logits, _, new_kv_caches = self(idx_cond, kv_caches=kv_caches)
         logits = logits[:, -1, :]
         if top_k is not None:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -295,5 +345,5 @@ class Ethos(nn.Module):
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
         if return_probs:
-            return next_token, probs
-        return next_token
+            return next_token, probs, new_kv_caches
+        return next_token, new_kv_caches

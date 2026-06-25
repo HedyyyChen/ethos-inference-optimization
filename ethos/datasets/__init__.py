@@ -3,3 +3,4 @@ from .base import TimelineDataset
 from .mimic import SofaPredictionDataset, ICUMortalityDataset
 from .mortality import MortalityDataset, SingleAdmissionMortalityDataset
 from .readmission import ReadmissionDataset
+from .mimic_mm import MMPFSDataset
